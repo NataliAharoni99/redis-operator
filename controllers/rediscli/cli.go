@@ -3,8 +3,10 @@ package rediscli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +26,7 @@ type RedisAuth struct {
 type CommandHandler interface {
 	buildCommand(routingPort string, args []string, auth *RedisAuth, opt ...string) ([]string, map[string]string)
 	executeCommand(args []string) (string, string, error)
+	executeCommandWithPipe(pipeArgs []string, args []string) (string, string, error)
 	buildRedisInfoModel(stdoutInfo string) (*RedisInfo, error)
 	buildRedisClusterInfoModel(stdoutInfo string) (*RedisClusterInfo, error)
 }
@@ -76,10 +79,80 @@ func (h *RunTimeCommandHandler) executeCommand(args []string) (string, string, e
 
 	var stdout, stderr bytes.Buffer
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultRedisCliTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*defaultRedisCliTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "redis-cli", args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return stdout.String(), stderr.String(), err
+	}
+
+	if err := cmd.Wait(); err != nil {
+		if e, ok := err.(*exec.ExitError); ok {
+
+			// If the process exited by itself, just return the error to the caller
+			if e.Exited() {
+				return stdout.String(), stderr.String(), e
+			}
+
+			// We know now that the process could be started, but didn't exit
+			// by itself. Something must have killed it. If the context is done,
+			// we can *assume* that it has been killed by the exec.Command.
+			// Let's return ctx.Err() so our user knows that this *might* be
+			// the case.
+
+			select {
+			case <-ctx.Done():
+				return stdout.String(), stderr.String(), errors.Errorf("exec of %v failed with: %v", args, ctx.Err())
+			default:
+				return stdout.String(), stderr.String(), errors.Errorf("exec of %v failed with: %v", args, e)
+			}
+		}
+		return stdout.String(), stderr.String(), err
+	}
+
+	stdOutput := strings.TrimSpace(stdout.String())
+	errOutput := strings.TrimSpace(stderr.String())
+
+	if errOutput != "" {
+		return stdOutput, errOutput, errors.New(errOutput)
+	}
+	if stdOutput != "" && strings.Contains(strings.ToLower(stdOutput), "error:") {
+		return stdOutput, stdOutput, errors.New(stdOutput)
+	}
+	return stdOutput, errOutput, nil
+}
+
+/* Executes command and returns cmd stdout, stderr and runtime error if appears
+ *  pipeArgs: argument list which will start the pipe the args list will be added to
+ *  args: arguments, flags and their values, in the order they should appear as if they were executed in the cli itself
+ */
+func (h *RunTimeCommandHandler) executeCommandWithPipe(pipeArgs []string, args []string) (string, string, error) {
+
+	var stdout, stderr bytes.Buffer
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*defaultRedisCliTimeout)
+	defer cancel()
+
+	argLine := ""
+	for _, arg := range pipeArgs {
+		argLine += arg + " "
+	}
+	if len(pipeArgs) > 0 {
+		argLine += "| "
+	}
+	argLine += "redis-cli"
+	for _, arg := range args {
+		argLine += " " + arg
+	}
+
+	println(argLine)
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", argLine)
+
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -256,6 +329,21 @@ func (r *RedisCLI) AddFollower(newNodeAddr string, existingNodeAddr string, lead
 	return stdout, nil
 }
 
+// AddLeader uses the '--cluster add-node' option on redis-cli to add a node to the cluster
+// newNodeAddr: Address of the follower that will join the cluster in a format of <ip>:<port> or <ip>: or <ip>
+// existingNodeAddr: IP of a node in the cluster in a format of <ip>:<port> or <ip>: or <ip>
+// leaderID: 	Redis ID of the leader that the new follower will replicate
+// In case port won't bw provided as part of the given addresses, cli default port will be added automatically to the address
+func (r *RedisCLI) AddLeader(newNodeAddr string, existingNodeAddr string, opt ...string) (string, error) {
+	args := []string{"--cluster", "add-node", addressPortDecider(newNodeAddr, r.Port), addressPortDecider(existingNodeAddr, r.Port)}
+	args, _ = r.Handler.buildCommand(r.Port, args, r.Auth, opt...)
+	stdout, stderr, err := r.Handler.executeCommand(args)
+	if err != nil || strings.TrimSpace(stderr) != "" || IsError(strings.TrimSpace(stdout)) {
+		return stdout, errors.Errorf("Failed to execute cluster add node (%s, %s): %s | %s | %v", newNodeAddr, existingNodeAddr, stdout, stderr, err)
+	}
+	return stdout, nil
+}
+
 // DelNode uses the '--cluster del-node' option of redis-cli to remove a node from the cluster
 // nodeIP: any node of the cluster
 // nodeID: node that needs to be removed
@@ -293,6 +381,27 @@ func (r *RedisCLI) Info(nodeIP string, opt ...string) (*RedisInfo, string, error
 	}
 	c, e := r.Handler.buildRedisInfoModel(stdout)
 	return c, stdout, e
+}
+
+func (r *RedisCLI) DBSIZE(nodeIP string, opt ...string) (int, string, error) {
+	args := []string{"-h", nodeIP, "DBSIZE"}
+	args, _ = r.Handler.buildCommand(r.Port, args, r.Auth, opt...)
+	stdout, stderr, err := r.Handler.executeCommand(args)
+	if err != nil || strings.TrimSpace(stderr) != "" || IsError(strings.TrimSpace(stdout)) {
+		return 0, "", errors.Errorf("Failed to execute INFO (%s): %s | %s | %v", nodeIP, stdout, stderr, err)
+	}
+	resultFormat := "\\(integer\\)\\s*(\\d+)"
+	comp := regexp.MustCompile(resultFormat)
+	matchingSubstrings := comp.FindAllStringSubmatch(stdout, -1)
+	if len(matchingSubstrings) > 1 {
+		result := matchingSubstrings[0][1]
+		dbsize, err := strconv.Atoi(result)
+		if err != nil {
+			return dbsize, stdout, nil
+		}
+		return 0, stdout, err
+	}
+	return 0, stdout, errors.New("redis-cli DBSIZE command errorred for unsupported result format: " + stdout)
 }
 
 // https://redis.io/commands/ping
@@ -386,6 +495,36 @@ func (r *RedisCLI) ClusterReset(nodeIP string, opt ...string) (string, error) {
 	return stdout, nil
 }
 
+func (r *RedisCLI) ClusterRebalance(nodeIP string, useEmptyMasters bool, opt ...string) (bool, string, error) {
+	args := []string{"--cluster", "rebalance", addressPortDecider(nodeIP, r.Port)}
+	if useEmptyMasters {
+		args = append(args, "--cluster-use-empty-masters")
+	}
+	args = append(args, "--cluster-yes")
+	args, _ = r.Handler.buildCommand(r.Port, args, r.Auth, opt...)
+	stdout, stderr, err := r.Handler.executeCommand(args)
+	if err != nil || strings.TrimSpace(stderr) != "" || IsError(strings.TrimSpace(stdout)) {
+		return false, stdout, errors.Errorf("Failed to execute cluster rebalance (%v): %s | %s | %v", nodeIP, stdout, stderr, err)
+	}
+	return true, stdout, nil
+}
+
+func (r *RedisCLI) ClusterReshard(nodeIP string, sourceId string, targetId string, slots int, opt ...string) (bool, string, error) {
+	args := []string{
+		"--cluster reshard", addressPortDecider(nodeIP, r.Port),
+		"--cluster-from", sourceId,
+		"--cluster-to", targetId,
+		"--cluster-slots", fmt.Sprint(slots),
+		"--cluster-yes",
+	}
+	args, _ = r.Handler.buildCommand(r.Port, args, r.Auth, opt...)
+	stdout, stderr, err := r.Handler.executeCommandWithPipe([]string{}, args)
+	if err != nil || strings.TrimSpace(stderr) != "" || IsError(strings.TrimSpace(stdout)) {
+		return false, stdout, errors.Errorf("Failed to execute cluster reshard (%v): from [%s] to [%s] stdout: %s | stderr : %s | err: %v", nodeIP, sourceId, targetId, stdout, stderr, err)
+	}
+	return true, stdout, nil
+}
+
 // https://redis.io/commands/flushall
 func (r *RedisCLI) Flushall(nodeIP string, opt ...string) (string, error) {
 
@@ -435,4 +574,15 @@ func (r *RedisCLI) ACLList(nodeIP string, opt ...string) (*RedisACL, string, err
 		return nil, "", err
 	}
 	return acl, stdout, nil
+}
+
+func (r *RedisCLI) ClusterFix(nodeIP string, opt ...string) (bool, string, error) {
+	args := []string{"--cluster", "fix", addressPortDecider(nodeIP, r.Port), "--cluster-fix-with-unreachable-masters", "--cluster-yes"}
+	args, _ = r.Handler.buildCommand(r.Port, args, r.Auth, opt...)
+	pipeArgs := []string{"yes", "yes"}
+	stdout, stderr, err := r.Handler.executeCommandWithPipe(pipeArgs, args)
+	if err != nil || strings.TrimSpace(stderr) != "" || IsError(strings.TrimSpace(stdout)) {
+		return false, stdout, errors.Errorf("Failed to execute cluster fix (%v): %s | %s | %v", addressPortDecider(nodeIP, r.Port), stdout, stderr, err)
+	}
+	return true, stdout, nil
 }

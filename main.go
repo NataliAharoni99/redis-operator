@@ -41,7 +41,7 @@ func getRedisCLI(log *logr.Logger) *rediscli.RedisCLI {
 
 func main() {
 	go server.StartServer()
-	
+
 	startManager()
 }
 
@@ -91,15 +91,18 @@ func startManager() {
 	k8sManager := controllers.K8sManager{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		Log:    configLogger}
+		Log:    configLogger,
+	}
 
 	if err = (&controllers.RedisClusterReconciler{
-		Client:   mgr.GetClient(),
-		Log:      rdcLogger,
-		Scheme:   mgr.GetScheme(),
-		RedisCLI: getRedisCLI(&rdcLogger),
-		Config:   &operatorConfig.Config,
-		State:    controllers.NotExists,
+		Client:               mgr.GetClient(),
+		Cache:                mgr.GetCache(),
+		Log:                  rdcLogger,
+		Scheme:               mgr.GetScheme(),
+		RedisCLI:             getRedisCLI(&rdcLogger),
+		Config:               &operatorConfig.Config,
+		State:                controllers.NotExists,
+		ClusterStatusMapName: "cluster-status-map",
 	}).SetupWithManager(mgr); err != nil {
 		setupLogger.Error(err, "unable to create controller", "controller", "RedisCluster")
 		os.Exit(1)
